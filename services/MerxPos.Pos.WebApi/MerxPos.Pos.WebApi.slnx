@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="MerxPos.Pos.Application/MerxPos.Pos.Application.csproj" />
+  <Project Path="MerxPos.Pos.Domain/MerxPos.Pos.Domain.csproj" />
+  <Project Path="MerxPos.Pos.Infrastructure/MerxPos.Pos.Infrastructure.csproj" />
+  <Project Path="MerxPos.Pos.WebApi/MerxPos.Pos.WebApi.csproj" />
+</Solution>

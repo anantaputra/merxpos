@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="8.0.24">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MerxPos.Pos.Application\MerxPos.Pos.Application.csproj" />
+    <ProjectReference Include="..\MerxPos.Pos.Domain\MerxPos.Pos.Domain.csproj" />
+    <ProjectReference Include="..\MerxPos.Pos.Infrastructure\MerxPos.Pos.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>
