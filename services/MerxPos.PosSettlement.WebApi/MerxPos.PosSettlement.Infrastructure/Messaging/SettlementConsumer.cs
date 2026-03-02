@@ -2,6 +2,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using MerxPos.PosSettlement.Contracts.Events;
@@ -12,60 +13,123 @@ namespace MerxPos.PosSettlement.Infrastructure.Messaging;
 public class SettlementConsumer : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
-    private IConnection? _connection;
-    private IChannel? _channel;
+    private readonly ILogger<SettlementConsumer> _logger;
 
-    public SettlementConsumer(IServiceScopeFactory scopeFactory)
+    private IConnection? _connection;
+    private IModel? _channel;
+
+    private const string MainExchange = "pos.exchange";
+    private const string MainQueue = "settlement.queue";
+    private const string MainRoutingKey = "transaction.created";
+
+    private const string RetryExchange = "settlement.retry.exchange";
+    private const string RetryQueue = "settlement.retry.queue";
+    private const string RetryRoutingKey = "settlement.retry";
+
+    private const string DlxExchange = "settlement.dlx.exchange";
+    private const string DlxQueue = "settlement.dlq";
+    private const string DlxRoutingKey = "settlement.failed";
+
+    private const int MaxRetry = 3;
+    private const int RetryDelayMilliseconds = 15000;
+
+    public SettlementConsumer(
+        IServiceScopeFactory scopeFactory,
+        ILogger<SettlementConsumer> logger)
     {
         _scopeFactory = scopeFactory;
+        _logger = logger;
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await InitializeRabbitMqAsync();
+        InitializeRabbitMq();
 
-        var consumer = new AsyncEventingBasicConsumer(_channel);
+        var consumer = new EventingBasicConsumer(_channel);
 
-        consumer.ReceivedAsync += async (sender, ea) =>
+        consumer.Received += async (sender, ea) =>
         {
             try
             {
                 var json = Encoding.UTF8.GetString(ea.Body.ToArray());
-
                 var message = JsonSerializer.Deserialize<TransactionCreatedEvent>(json);
 
-                if (message != null)
-                {
-                    using var scope = _scopeFactory.CreateScope();
-                    var service = scope.ServiceProvider
-                        .GetRequiredService<ISettlementService>();
+                if (message == null)
+                    throw new Exception("Deserialization failed");
 
-                    await service.HandleTransactionCreatedAsync(
-                        message.TransactionId,
-                        message.Amount);
-                }
+                using var scope = _scopeFactory.CreateScope();
+                var service = scope.ServiceProvider
+                    .GetRequiredService<ISettlementService>();
 
-                // ✅ ACK only after success
-                await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                await service.HandleTransactionCreatedAsync(
+                    message.TransactionId,
+                    message.Amount);
+
+                _channel!.BasicAck(ea.DeliveryTag, false);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // ❌ Requeue if error
-                await _channel!.BasicNackAsync(
-                    ea.DeliveryTag,
-                    multiple: false,
-                    requeue: true);
+                _logger.LogError(ex, "Settlement processing failed");
+
+                HandleRetryOrDlq(ea);
+
+                _channel!.BasicAck(ea.DeliveryTag, false);
             }
         };
 
-        await _channel!.BasicConsumeAsync(
-            queue: "settlement.queue",
+        _channel!.BasicConsume(
+            queue: MainQueue,
             autoAck: false,
-            consumer: consumer,
-            cancellationToken: stoppingToken);
+            consumer: consumer);
+
+        return Task.CompletedTask;
     }
 
-    private async Task InitializeRabbitMqAsync()
+    private void HandleRetryOrDlq(BasicDeliverEventArgs ea)
+    {
+        var retryCount = GetRetryCount(ea);
+
+        if (retryCount >= MaxRetry)
+        {
+            _logger.LogWarning("Moved to DLQ after {RetryCount} retries", retryCount);
+
+            _channel!.BasicPublish(
+                exchange: DlxExchange,
+                routingKey: DlxRoutingKey,
+                basicProperties: ea.BasicProperties,
+                body: ea.Body);
+        }
+        else
+        {
+            _logger.LogWarning("Retry attempt {RetryCount}", retryCount + 1);
+
+            var props = _channel!.CreateBasicProperties();
+            props.Headers = new Dictionary<string, object>
+            {
+                { "x-retry-count", retryCount + 1 }
+            };
+            props.Persistent = true;
+
+            _channel.BasicPublish(
+                exchange: RetryExchange,
+                routingKey: RetryRoutingKey,
+                basicProperties: props,
+                body: ea.Body);
+        }
+    }
+
+    private static int GetRetryCount(BasicDeliverEventArgs ea)
+    {
+        if (ea.BasicProperties.Headers != null &&
+            ea.BasicProperties.Headers.TryGetValue("x-retry-count", out var value))
+        {
+            return Convert.ToInt32(value);
+        }
+
+        return 0;
+    }
+
+    private void InitializeRabbitMq()
     {
         var factory = new ConnectionFactory
         {
@@ -74,34 +138,46 @@ public class SettlementConsumer : BackgroundService
             Password = "guest"
         };
 
-        _connection = await factory.CreateConnectionAsync();
-        _channel = await _connection.CreateChannelAsync();
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
 
-        await _channel.ExchangeDeclareAsync(
-            exchange: "pos.exchange",
-            type: ExchangeType.Direct,
-            durable: true);
+        // Main Exchange
+        _channel.ExchangeDeclare(MainExchange, ExchangeType.Direct, true);
 
-        await _channel.QueueDeclareAsync(
-            queue: "settlement.queue",
-            durable: true,
-            exclusive: false,
-            autoDelete: false);
+        // Main Queue
+        _channel.QueueDeclare(MainQueue, true, false, false);
+        _channel.QueueBind(MainQueue, MainExchange, MainRoutingKey);
 
-        await _channel.QueueBindAsync(
-            queue: "settlement.queue",
-            exchange: "pos.exchange",
-            routingKey: "transaction.created");
+        // Retry Exchange
+        _channel.ExchangeDeclare(RetryExchange, ExchangeType.Direct, true);
+
+        // Retry Queue
+        _channel.QueueDeclare(
+            RetryQueue,
+            true,
+            false,
+            false,
+            new Dictionary<string, object>
+            {
+                { "x-message-ttl", RetryDelayMilliseconds },
+                { "x-dead-letter-exchange", MainExchange },
+                { "x-dead-letter-routing-key", MainRoutingKey }
+            });
+
+        _channel.QueueBind(RetryQueue, RetryExchange, RetryRoutingKey);
+
+        // DLX
+        _channel.ExchangeDeclare(DlxExchange, ExchangeType.Direct, true);
+
+        _channel.QueueDeclare(DlxQueue, true, false, false);
+        _channel.QueueBind(DlxQueue, DlxExchange, DlxRoutingKey);
     }
 
-    public override async Task StopAsync(CancellationToken cancellationToken)
+    public override Task StopAsync(CancellationToken cancellationToken)
     {
-        if (_channel != null)
-            await _channel.CloseAsync();
+        _channel?.Close();
+        _connection?.Close();
 
-        if (_connection != null)
-            await _connection.CloseAsync();
-
-        await base.StopAsync(cancellationToken);
+        return base.StopAsync(cancellationToken);
     }
 }
