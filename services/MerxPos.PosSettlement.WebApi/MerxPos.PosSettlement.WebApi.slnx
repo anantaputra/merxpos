@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="MerxPos.PosSettlement.Application/MerxPos.PosSettlement.Application.csproj" />
+  <Project Path="MerxPos.PosSettlement.Contracts/MerxPos.PosSettlement.Contracts.csproj" />
+  <Project Path="MerxPos.PosSettlement.Domain/MerxPos.PosSettlement.Domain.csproj" />
+  <Project Path="MerxPos.PosSettlement.Infrastructure/MerxPos.PosSettlement.Infrastructure.csproj" Id="deff89bd-724c-46fb-a912-385d4d7ec593" />
+  <Project Path="MerxPos.PosSettlement.WebApi/MerxPos.PosSettlement.WebApi.csproj" />
+</Solution>
