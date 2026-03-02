@@ -141,11 +141,26 @@ public class SettlementConsumer : BackgroundService
         _connection = factory.CreateConnection();
         _channel = _connection.CreateModel();
 
+        // 🔥 QoS WAJIB setelah channel dibuat
+        _channel.BasicQos(
+            prefetchSize: 0,
+            prefetchCount: 10,
+            global: false);
+
         // Main Exchange
         _channel.ExchangeDeclare(MainExchange, ExchangeType.Direct, true);
 
         // Main Queue
-        _channel.QueueDeclare(MainQueue, true, false, false);
+        _channel.QueueDeclare(
+            MainQueue,
+            true,
+            false,
+            false,
+            new Dictionary<string, object>
+            {
+                { "x-dead-letter-exchange", DlxExchange },
+                { "x-dead-letter-routing-key", DlxRoutingKey }
+            });
         _channel.QueueBind(MainQueue, MainExchange, MainRoutingKey);
 
         // Retry Exchange
