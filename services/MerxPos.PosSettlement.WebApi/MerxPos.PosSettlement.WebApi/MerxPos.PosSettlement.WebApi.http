@@ -1,0 +1,6 @@
+@MerxPos.PosSettlement.WebApi_HostAddress = http://localhost:5197
+
+GET {{MerxPos.PosSettlement.WebApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
