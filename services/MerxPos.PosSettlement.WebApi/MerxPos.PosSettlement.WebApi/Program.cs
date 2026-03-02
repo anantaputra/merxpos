@@ -1,3 +1,4 @@
+using MerxPos.PosSettlement.Application.Abstractions;
 using MerxPos.PosSettlement.Application.Services;
 using MerxPos.PosSettlement.Domain.Repositories;
 using MerxPos.PosSettlement.Infrastructure.Messaging;
@@ -17,8 +18,15 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddDbContext<SettlementDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
+// Register Repository
 builder.Services.AddScoped<ISettlementRepository, SettlementRepository>();
-builder.Services.AddScoped<SettlementService>();
+builder.Services.AddScoped<IProcessedMessageRepository, ProcessedMessageRepository>();
+
+// Register Service
+builder.Services.AddScoped<ISettlementService, SettlementService>();
+builder.Services.AddScoped<IIdempotencyService, IdempotencyService>();
+
+
 builder.Services.AddHostedService<SettlementConsumer>();
 
 var app = builder.Build();

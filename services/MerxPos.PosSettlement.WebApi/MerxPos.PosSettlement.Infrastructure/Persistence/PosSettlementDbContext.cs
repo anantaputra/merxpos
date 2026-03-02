@@ -11,6 +11,7 @@ public class SettlementDbContext : DbContext
     }
 
     public DbSet<Settlement> Settlements => Set<Settlement>();
+    public DbSet<ProcessedMessage> ProcessedMessages { get; set; } = default!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

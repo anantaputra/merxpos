@@ -1,5 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using MerxPos.PosSettlement.Application.Services;
+using MerxPos.PosSettlement.Application.Abstractions;
 
 namespace MerxPos.PosSettlement.Api.Controllers;
 
@@ -7,9 +7,9 @@ namespace MerxPos.PosSettlement.Api.Controllers;
 [Route("api/[controller]")]
 public class SettlementsController : ControllerBase
 {
-    private readonly SettlementService _settlementService;
+    private readonly ISettlementService _settlementService;
 
-    public SettlementsController(SettlementService settlementService)
+    public SettlementsController(ISettlementService settlementService)
     {
         _settlementService = settlementService;
     }

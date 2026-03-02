@@ -1,12 +1,12 @@
-﻿using System.Text;
-using System.Text.Json;
+﻿using MerxPos.PosSettlement.Application.Abstractions;
+using MerxPos.PosSettlement.Contracts.Events;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using MerxPos.PosSettlement.Contracts.Events;
-using MerxPos.PosSettlement.Application.Abstractions;
+using System.Text;
+using System.Text.Json;
 
 namespace MerxPos.PosSettlement.Infrastructure.Messaging;
 
@@ -45,33 +45,40 @@ public class SettlementConsumer : BackgroundService
     {
         InitializeRabbitMq();
 
-        var consumer = new EventingBasicConsumer(_channel);
+        var consumer = new AsyncEventingBasicConsumer(_channel);
 
         consumer.Received += async (sender, ea) =>
         {
+            var body = ea.Body.ToArray();
+            var message = Encoding.UTF8.GetString(body);
+
+            var correlationId = ea.BasicProperties.CorrelationId ?? "N/A";
+            var retryCount = GetRetryCount(ea);
+
             try
             {
-                var json = Encoding.UTF8.GetString(ea.Body.ToArray());
-                var message = JsonSerializer.Deserialize<TransactionCreatedEvent>(json);
+                _logger.LogInformation(
+                    "Processing | CorrelationId={CorrelationId} | RetryCount={RetryCount}",
+                    correlationId,
+                    retryCount);
 
-                if (message == null)
-                    throw new Exception("Deserialization failed");
-
-                using var scope = _scopeFactory.CreateScope();
-                var service = scope.ServiceProvider
-                    .GetRequiredService<ISettlementService>();
-
-                await service.HandleTransactionCreatedAsync(
-                    message.TransactionId,
-                    message.Amount);
+                await ProcessMessage(message);
 
                 _channel!.BasicAck(ea.DeliveryTag, false);
+
+                _logger.LogInformation(
+                    "SUCCESS | CorrelationId={CorrelationId}",
+                    correlationId);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Settlement processing failed");
+                _logger.LogError(
+                    ex,
+                    "FAILED | CorrelationId={CorrelationId} | RetryCount={RetryCount}",
+                    correlationId,
+                    retryCount);
 
-                HandleRetryOrDlq(ea);
+                HandleRetryOrDlq(ea, retryCount);
 
                 _channel!.BasicAck(ea.DeliveryTag, false);
             }
@@ -85,13 +92,16 @@ public class SettlementConsumer : BackgroundService
         return Task.CompletedTask;
     }
 
-    private void HandleRetryOrDlq(BasicDeliverEventArgs ea)
+    private void HandleRetryOrDlq(BasicDeliverEventArgs ea, int retryCount)
     {
-        var retryCount = GetRetryCount(ea);
+        var correlationId = ea.BasicProperties.CorrelationId ?? "N/A";
 
         if (retryCount >= MaxRetry)
         {
-            _logger.LogWarning("Moved to DLQ after {RetryCount} retries", retryCount);
+            _logger.LogError(
+                "SENT TO DLQ | CorrelationId={CorrelationId} | FinalRetry={RetryCount}",
+                correlationId,
+                retryCount);
 
             _channel!.BasicPublish(
                 exchange: DlxExchange,
@@ -101,7 +111,10 @@ public class SettlementConsumer : BackgroundService
         }
         else
         {
-            _logger.LogWarning("Retry attempt {RetryCount}", retryCount + 1);
+            _logger.LogWarning(
+                "RETRYING | CorrelationId={CorrelationId} | NextRetry={NextRetry}",
+                correlationId,
+                retryCount + 1);
 
             var props = _channel!.CreateBasicProperties();
             props.Headers = new Dictionary<string, object>
@@ -109,6 +122,7 @@ public class SettlementConsumer : BackgroundService
                 { "x-retry-count", retryCount + 1 }
             };
             props.Persistent = true;
+            props.CorrelationId = correlationId;
 
             _channel.BasicPublish(
                 exchange: RetryExchange,
@@ -123,6 +137,9 @@ public class SettlementConsumer : BackgroundService
         if (ea.BasicProperties.Headers != null &&
             ea.BasicProperties.Headers.TryGetValue("x-retry-count", out var value))
         {
+            if (value is byte[] bytes)
+                return int.Parse(Encoding.UTF8.GetString(bytes));
+
             return Convert.ToInt32(value);
         }
 
@@ -135,22 +152,25 @@ public class SettlementConsumer : BackgroundService
         {
             HostName = "localhost",
             UserName = "guest",
-            Password = "guest"
+            Password = "guest",
+            DispatchConsumersAsync = true,
+            AutomaticRecoveryEnabled = true,
+            NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
         };
 
         _connection = factory.CreateConnection();
         _channel = _connection.CreateModel();
 
-        // 🔥 QoS WAJIB setelah channel dibuat
-        _channel.BasicQos(
-            prefetchSize: 0,
-            prefetchCount: 10,
-            global: false);
+        _channel.BasicQos(0, 10, false);
 
-        // Main Exchange
+        // DLX
+        _channel.ExchangeDeclare(DlxExchange, ExchangeType.Direct, true);
+        _channel.QueueDeclare(DlxQueue, true, false, false);
+        _channel.QueueBind(DlxQueue, DlxExchange, DlxRoutingKey);
+
+        // Main Exchange + Queue
         _channel.ExchangeDeclare(MainExchange, ExchangeType.Direct, true);
 
-        // Main Queue
         _channel.QueueDeclare(
             MainQueue,
             true,
@@ -161,12 +181,12 @@ public class SettlementConsumer : BackgroundService
                 { "x-dead-letter-exchange", DlxExchange },
                 { "x-dead-letter-routing-key", DlxRoutingKey }
             });
+
         _channel.QueueBind(MainQueue, MainExchange, MainRoutingKey);
 
-        // Retry Exchange
+        // Retry Exchange + Queue
         _channel.ExchangeDeclare(RetryExchange, ExchangeType.Direct, true);
 
-        // Retry Queue
         _channel.QueueDeclare(
             RetryQueue,
             true,
@@ -180,19 +200,44 @@ public class SettlementConsumer : BackgroundService
             });
 
         _channel.QueueBind(RetryQueue, RetryExchange, RetryRoutingKey);
+    }
 
-        // DLX
-        _channel.ExchangeDeclare(DlxExchange, ExchangeType.Direct, true);
+    private async Task ProcessMessage(string message)
+    {
+        using var scope = _scopeFactory.CreateScope();
 
-        _channel.QueueDeclare(DlxQueue, true, false, false);
-        _channel.QueueBind(DlxQueue, DlxExchange, DlxRoutingKey);
+        var idempotencyService = scope.ServiceProvider
+            .GetRequiredService<IIdempotencyService>();
+
+        var settlementService = scope.ServiceProvider
+            .GetRequiredService<ISettlementService>();
+
+        var transaction = JsonSerializer.Deserialize<TransactionCreatedEvent>(message);
+
+        var messageId = transaction!.TransactionId.ToString();
+
+        if (await idempotencyService.HasProcessedAsync(messageId))
+        {
+            _logger.LogWarning(
+                "DUPLICATE MESSAGE | TransactionId={TransactionId}",
+                messageId);
+
+            return;
+        }
+
+        await settlementService.HandleTransactionCreatedAsync(transaction.TransactionId, transaction.Amount);
+
+        await idempotencyService.MarkAsProcessedAsync(messageId);
+
+        _logger.LogInformation(
+            "PROCESSED & MARKED | TransactionId={TransactionId}",
+            messageId);
     }
 
     public override Task StopAsync(CancellationToken cancellationToken)
     {
         _channel?.Close();
         _connection?.Close();
-
         return base.StopAsync(cancellationToken);
     }
 }
